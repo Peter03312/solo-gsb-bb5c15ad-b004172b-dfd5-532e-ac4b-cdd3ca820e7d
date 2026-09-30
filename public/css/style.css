@@ -136,6 +136,8 @@ table.list a { color: var(--accent); font-weight: 600; text-decoration: none; }
 .seam-row { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; font-size: 13px; background: #fff; }
 .seam-row.active { outline: 2px solid var(--sel); }
 .seam-row .top { display: flex; justify-content: space-between; align-items: center; gap: 6px; cursor: pointer; }
+.seam-row .seam-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.seam-row .seam-actions button { padding: 4px 10px; font-size: 12px; }
 .seam-row .note { color: var(--muted); margin-top: 4px; }
 .seam-row .residual { margin-top: 4px; font-size: 12px; }
 .residual.ok { color: var(--ok); }

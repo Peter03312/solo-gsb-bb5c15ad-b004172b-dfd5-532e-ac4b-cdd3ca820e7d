@@ -1,6 +1,7 @@
 import { api } from './api.js';
 import { esc, toast, openModal, confirmAsync } from './ui.js';
 import { openScaleModal, openAlignModal } from './modals.js';
+import { openReviseSeamModal } from './revise.js';
 import {
   sherdPpm, sherdMm, computeCards, sherdWorldPose, hitSherd, applyPose, DEG,
 } from './geo-client.js';
@@ -425,7 +426,10 @@ export async function mountWorkspace(projectId) {
             </span><br/>
             <span class="kv">#${s.from_id} ${esc(a ? a.label : '')} → #${s.to_id} ${esc(b ? b.label : '')}</span>
           </span>
-          <button class="danger" data-undo="${s.id}">撤销</button>
+          <span class="seam-actions">
+            <button class="secondary" data-revise="${s.id}">修订</button>
+            <button class="danger" data-undo="${s.id}">撤销</button>
+          </span>
         </div>
         <div class="kv">θ=${s.theta_deg}°, tx=${s.tx} mm, ty=${s.ty} mm</div>
         ${s.join_note ? `<div class="note">📝 ${esc(s.join_note)}</div>` : ''}
@@ -445,12 +449,28 @@ export async function mountWorkspace(projectId) {
 
     pane.querySelectorAll('.seam-row').forEach((el) => {
       el.addEventListener('click', (e) => {
-        if (e.target.dataset.undo) return;
+        if (e.target.dataset.undo || e.target.dataset.revise) return;
         selected.seamId = parseInt(el.dataset.id, 10);
         selected.sherdId = null;
         highlightSeamIds = new Set([selected.seamId]);
         renderAll();
       });
+    });
+    pane.querySelectorAll('[data-revise]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const id = parseInt(btn.dataset.revise, 10);
+        const seam = seamById(id);
+        if (!seam) return;
+        openReviseSeamModal(seam, {
+          getVersion: () => state.project.version,
+          onApplied: async (next) => {
+            applyServerState(next);
+            toast(`接缝 #${id} 已修订，版本推进到 v${next.project.version}，布局与预览一致`, 'success');
+          },
+          onError: handleWriteError,
+        });
+      };
     });
     pane.querySelectorAll('[data-undo]').forEach((btn) => {
       btn.onclick = async (e) => {

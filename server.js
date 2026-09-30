@@ -65,6 +65,42 @@ function getProjectOr404(id) {
   return p;
 }
 
+// 解析接缝修订入参（旋转角、毫米平移、说明）。
+// 说明缺省时沿用原接缝说明；身份（from/to）与排序（id）不接受修改。
+function parseRevisionBody(body, seam) {
+  const theta = num(body.theta_deg, 'theta_deg', { min: -360, max: 360 });
+  const tx = num(body.tx, 'tx', { min: -100000, max: 100000 });
+  const ty = num(body.ty, 'ty', { min: -100000, max: 100000 });
+  const joinNote = body.join_note === undefined
+    ? seam.join_note
+    : str(body.join_note, 'join_note', { max: 2000, required: false });
+  return { theta_deg: theta, tx, ty, join_note: joinNote };
+}
+
+// 把布局引擎算出的超差闭合环整理为对外错误体：逐条超差接缝 + 冲突链。
+// 用“修订后”的接缝集合标注说明，使冲突链与预览所见一致。
+function buildRevisionViolations(result, sherds, toleranceMm) {
+  const seamsById = new Map(result.revised_seams.map((s) => [s.id, s]));
+  const sherdById = new Map(sherds.map((s) => [s.id, s]));
+  return result.violations.map((v) => ({
+    reason: 'cycle_tolerance_exceeded',
+    seam_id: v.seam_id,
+    from_id: v.from_id,
+    to_id: v.to_id,
+    deviation_mm: v.distance_mm,
+    rotation_deg: v.rotation_deg,
+    tolerance_mm: toleranceMm,
+    conflict_chain: {
+      sherds: v.conflict_chain.sherd_path.map((id) => ({ id, label: sherdById.get(id).label })),
+      seams: v.conflict_chain.seam_path.map((sid) => {
+        const se = seamsById.get(sid);
+        return { id: sid, from_id: se.from_id, to_id: se.to_id, join_note: se.join_note };
+      }),
+      closing_seam: { id: v.seam_id, from_id: v.from_id, to_id: v.to_id },
+    },
+  }));
+}
+
 // 所有写操作必须携带 Base-Version 头；与库中版本不一致即冲突，拒绝写入。
 function checkVersion(req, project) {
   const raw = req.header('Base-Version');
@@ -128,6 +164,17 @@ function statePayload(state) {
     })),
     layout: state.computed,
   };
+}
+
+// 接缝修订（预览/确认共用）的返回体：保持与 statePayload 相同的接缝读取契约，
+// 但接缝列表为“按原 id 与排序替换参数后”的假设集合，layout 为相应重算结果。
+// 预览时该结果不入库；确认成功后 GET /api/projects/:id 与之一致。
+function revisionPayload(project, sherds, result, seamId) {
+  const fakeState = { project, sherds, seams: result.revised_seams, computed: result.layout };
+  const payload = statePayload(fakeState);
+  payload.base_version = project.version;
+  payload.revised_seam_id = seamId;
+  return payload;
 }
 
 const ALLOWED_EXT = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' };
@@ -372,6 +419,74 @@ app.delete('/api/seams/:id', wrap((req, res) => {
     bump(seam.project_id);
   });
   txn();
+  res.json(statePayload(loadState(seam.project_id)));
+}));
+
+// ---------- 接缝修订（已采纳接缝改旋转角/毫米平移/说明）----------
+//
+// 两步：
+//   POST .../seams/:id/revision-preview  只读预览（不校验/不要求 Base-Version，不改动方案）
+//   PATCH /api/seams/:id                 确认修订（必须带当前 Base-Version）
+//
+// 预览与确认都用 layout.evaluateSeamRevision：保持接缝 id 与采纳排序不变，
+// 仅替换该接缝参数后重算全部陶片位姿与“每一个”闭合环残差。
+// 确认时在同一事务内基于当前版本原子地重新校验：任一闭合环超差即 422
+// （返回每条超差接缝与冲突链），接缝、版本、布局均不变。
+
+app.post('/api/seams/:id/revision-preview', wrap((req, res) => {
+  const seamId = num(req.params.id, 'id');
+  const seam = db.prepare('SELECT * FROM seams WHERE id = ?').get(seamId);
+  if (!seam) throw new HttpError(404, '接缝不存在');
+  const project = getProjectOr404(seam.project_id);
+  const revised = parseRevisionBody(req.body || {}, seam);
+
+  const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ?').all(seam.project_id);
+  const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(seam.project_id);
+  const result = layout.evaluateSeamRevision(sherds, seams, seamId, revised, project.tolerance_mm);
+  // 接缝存在时 evaluateSeamRevision 必返回非 null。
+  const payload = revisionPayload(project, sherds, result, seamId);
+  payload.preview_only = true;
+  payload.violations = buildRevisionViolations(result, sherds, project.tolerance_mm);
+  res.json(payload);
+}));
+
+app.patch('/api/seams/:id', wrap((req, res) => {
+  const seamId = num(req.params.id, 'id');
+  const seam = db.prepare('SELECT * FROM seams WHERE id = ?').get(seamId);
+  if (!seam) throw new HttpError(404, '接缝不存在');
+  const project = getProjectOr404(seam.project_id);
+  // 确认必须基于当前版本：落后/超前一律 409，且不得套用旧预览。
+  checkVersion(req, project);
+  const revised = parseRevisionBody(req.body || {}, seam);
+
+  // 单事务：读取当前接缝/陶片 → 全量重算并校验所有闭合环 → 超差则抛错回滚
+  // （接缝与版本都不变）；通过才更新该接缝并只 bump 一次版本。
+  const txn = db.transaction(() => {
+    const current = db.prepare('SELECT * FROM projects WHERE id = ?').get(seam.project_id);
+    if (current.version !== project.version) {
+      throw new HttpError(409, '版本冲突：方案已被其他人修改，请刷新后基于最新版本重试', {
+        current_version: current.version,
+        your_version: project.version,
+      });
+    }
+    const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ?').all(seam.project_id);
+    const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(seam.project_id);
+    const result = layout.evaluateSeamRevision(sherds, seams, seamId, revised, current.tolerance_mm);
+    if (result.violations.length) {
+      const violations = buildRevisionViolations(result, sherds, current.tolerance_mm);
+      throw new HttpError(422,
+        `修订会使 ${violations.length} 条闭合接缝残差超过 ${current.tolerance_mm} mm 容差，已拒绝修订，原接缝、版本与布局均不变。`,
+        {
+          reason: 'revision_cycle_tolerance_exceeded',
+          violations,
+        });
+    }
+    db.prepare('UPDATE seams SET theta_deg = ?, tx = ?, ty = ?, join_note = ? WHERE id = ?')
+      .run(revised.theta_deg, revised.tx, revised.ty, revised.join_note, seamId);
+    bump(seam.project_id);
+  });
+  txn();
+
   res.json(statePayload(loadState(seam.project_id)));
 }));
 

@@ -47,4 +47,9 @@ export const api = {
     request('POST', `/api/projects/${pid}/seams`, { version, body: payload }).then((r) => ({ data: r.data, status: r.status })),
   deleteSeam: (seamId, version) =>
     request('DELETE', `/api/seams/${seamId}`, { version }).then((r) => r.data),
+  // 接缝修订：预览为只读、不带版本；确认必须带当前 Base-Version。
+  reviseSeamPreview: (seamId, payload) =>
+    request('POST', `/api/seams/${seamId}/revision-preview`, { body: payload }).then((r) => r.data),
+  reviseSeam: (seamId, version, payload) =>
+    request('PATCH', `/api/seams/${seamId}`, { version, body: payload }).then((r) => r.data),
 };
