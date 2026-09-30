@@ -97,6 +97,85 @@ function loadState(projectId) {
   return { project, sherds, seams, computed };
 }
 
+function seamPayload(s) {
+  return {
+    id: s.id,
+    from_id: s.from_id,
+    to_id: s.to_id,
+    theta_deg: s.theta_deg,
+    tx: s.tx,
+    ty: s.ty,
+    join_note: s.join_note,
+    created_at: s.created_at,
+  };
+}
+
+// 修订预览/确认共用：保持接缝身份与排序，仅替换参数，原子重算布局与全部闭合环。
+// 返回 { project, sherds, seams(含修订后的接缝), layout, revised_seam_id,
+//   acceptable, tolerance_mm, violations(超差接缝 + 冲突链明细) }。
+// 纯计算：不写库。
+function buildRevisionPreview(seam, revised) {
+  const project = getProjectOr404(seam.project_id);
+  const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ? ORDER BY id').all(seam.project_id);
+  const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(seam.project_id);
+
+  const ev = layout.evaluateRevision(sherds, seams, seam.id, revised, project.tolerance_mm);
+
+  const seamsById = new Map(seams.map((s) => [s.id, s]));
+  const sherdById = new Map(sherds.map((s) => [s.id, s]));
+  const violations = ev.violations.map((v) => ({
+    seam_id: v.seam_id,
+    from_id: v.from_id,
+    to_id: v.to_id,
+    distance_mm: v.distance_mm,
+    rotation_deg: v.rotation_deg,
+    tolerance_mm: v.tolerance_mm,
+    conflict_chain: {
+      sherds: v.sherd_path.map((id) => ({ id, label: sherdById.get(id).label })),
+      seams: v.seam_path.map((sid) => ({
+        id: sid,
+        from_id: seamsById.get(sid).from_id,
+        to_id: seamsById.get(sid).to_id,
+        join_note: seamsById.get(sid).join_note,
+      })),
+    },
+  }));
+
+  const revisedSeams = seams.map((s) => (s.id === seam.id ? ev.revised_seam : s));
+
+  return {
+    project: {
+      id: project.id,
+      name: project.name,
+      tolerance_mm: project.tolerance_mm,
+      version: project.version,
+      updated_at: project.updated_at,
+    },
+    sherds: sherds.map((s) => ({
+      id: s.id,
+      label: s.label,
+      image_url: `/api/sherds/${s.id}/image`,
+      img_w: s.img_w,
+      img_h: s.img_h,
+      scale_px: s.scale_px,
+      scale_mm: s.scale_mm,
+      note: s.note,
+    })),
+    seams: revisedSeams.map(seamPayload),
+    layout: {
+      groups: ev.groups,
+      unconnected: ev.unconnected,
+      residuals: ev.residuals,
+    },
+    revised_seam_id: seam.id,
+    revised_seam: seamPayload(ev.revised_seam),
+    original_seam: seamPayload(seam),
+    acceptable: violations.length === 0,
+    tolerance_mm: project.tolerance_mm,
+    violations,
+  };
+}
+
 function statePayload(state) {
   return {
     project: {
@@ -116,16 +195,7 @@ function statePayload(state) {
       scale_mm: s.scale_mm,
       note: s.note,
     })),
-    seams: state.seams.map((s) => ({
-      id: s.id,
-      from_id: s.from_id,
-      to_id: s.to_id,
-      theta_deg: s.theta_deg,
-      tx: s.tx,
-      ty: s.ty,
-      join_note: s.join_note,
-      created_at: s.created_at,
-    })),
+    seams: state.seams.map(seamPayload),
     layout: state.computed,
   };
 }
@@ -372,6 +442,88 @@ app.delete('/api/seams/:id', wrap((req, res) => {
     bump(seam.project_id);
   });
   txn();
+  res.json(statePayload(loadState(seam.project_id)));
+}));
+
+// ---------- 接缝修订（旋转角 / 毫米平移 / 说明） ----------
+// 共享校验：与新建接缝同范围。from/to 不可改（身份不变）。
+function parseRevision(body) {
+  return {
+    theta_deg: num(body && body.theta_deg, 'theta_deg', { min: -360, max: 360 }),
+    tx: num(body && body.tx, 'tx', { min: -100000, max: 100000 }),
+    ty: num(body && body.ty, 'ty', { min: -100000, max: 100000 }),
+    join_note: str(body && body.join_note, 'join_note', { max: 2000, required: false }),
+  };
+}
+
+function getSeamOr404(id) {
+  const seam = db.prepare('SELECT * FROM seams WHERE id = ?').get(num(id, 'id'));
+  if (!seam) throw new HttpError(404, '接缝不存在');
+  return seam;
+}
+
+// 预览：按原接缝身份及排序重算位姿与全部闭合环残差，指出超容差接缝的冲突链。
+// 只读——绝不写库、不推进版本，也不要求 Base-Version（不改变任何状态）。
+app.post('/api/seams/:id/revision-preview', wrap((req, res) => {
+  const seam = getSeamOr404(req.params.id);
+  const revised = parseRevision(req.body || {});
+  res.json(buildRevisionPreview(seam, revised));
+}));
+
+// 确认修订：必须基于当前方案版本，在同一事务内原子重算全部闭合环。
+// 任一残差超差即回滚（接缝、版本、布局均不变）并返回超差接缝与冲突链(422)；
+// 版本落后按现有 Base-Version 约定返回 409（不得套用旧预览）。
+app.patch('/api/seams/:id', wrap((req, res) => {
+  const seam = getSeamOr404(req.params.id);
+  const revised = parseRevision(req.body || {});
+
+  // 事务内再读项目并校验版本 + 重算，保证“校验—写入”原子，
+  // 不会有其他写操作穿插导致基于过期数据采纳。
+  class RevisionRejected extends Error {}
+
+  let preview;
+  const txn = db.transaction(() => {
+    // 事务内重读项目与接缝并校验版本 + 重算，保证“读取—校验—写入”原子，
+    // 不会有其他写操作穿插导致基于过期数据采纳。
+    const project = getProjectOr404(seam.project_id);
+    checkVersion(req, project); // 版本不符抛 HttpError(409/428)，事务回滚
+    const currentSeam = db.prepare('SELECT * FROM seams WHERE id = ?').get(seam.id);
+    if (!currentSeam) throw new HttpError(404, '接缝不存在');
+    preview = buildRevisionPreview(currentSeam, revised);
+    if (preview.violations.length) {
+      // 抛错以回滚：UPDATE 与 bump 都不会执行，原接缝/版本/布局不变
+      throw new RevisionRejected();
+    }
+    db.prepare(
+      'UPDATE seams SET theta_deg = ?, tx = ?, ty = ?, join_note = ? WHERE id = ?'
+    ).run(revised.theta_deg, revised.tx, revised.ty, revised.join_note, currentSeam.id);
+    bump(currentSeam.project_id);
+  });
+
+  try {
+    txn();
+  } catch (e) {
+    if (e instanceof RevisionRejected) {
+      const detail = preview.violations
+        .map((v) => `接缝 #${v.seam_id} 偏差 ${v.distance_mm} mm / ${v.rotation_deg}°`)
+        .join('；');
+      return res.status(422).json({
+        error: {
+          reason: 'revision_cycle_tolerance_exceeded',
+          message:
+            `修订被拒绝：重算全部闭合环后有 ${preview.violations.length} 条接缝残差超过容差 ` +
+            `${preview.tolerance_mm} mm（${detail}）。接缝 #${seam.id}、方案版本与布局均保持不变。`,
+          tolerance_mm: preview.tolerance_mm,
+          violations: preview.violations,
+          // 附带“若采纳会得到的布局”，与预览口径一致，便于调用方直接呈现；库中并未改变
+          preview_layout: preview.layout,
+        },
+      });
+    }
+    throw e; // 409/428/400 等 HttpError 走统一错误处理
+  }
+
+  // 成功：接缝 ID 与排序不变，版本只递增一次，读取布局与预览一致
   res.json(statePayload(loadState(seam.project_id)));
 }));
 

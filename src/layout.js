@@ -149,9 +149,11 @@ function round3(v) {
   return Math.round(v * 1000) / 1000;
 }
 
-// 主入口：计算全方案布局。布局不持久化——每次都从接缝现算，
-// 撤销接缝后不可能残留旧位姿。
-function computeLayout(sherds, seams, toleranceMm) {
+// 主分析入口：计算全方案布局，并逐条评估成环接缝的闭合残差。
+// 布局不持久化——每次都从接缝现算，撤销/修订接缝后不可能残留旧位姿。
+// 返回中除 groups/unconnected/residuals 外，还带 violations：
+// 所有残差超过容差的成环接缝及其在生成树上的冲突链（修订时需要）。
+function analyzeLayout(sherds, seams, toleranceMm) {
   const sherdIds = sherds.map((s) => s.id).sort((a, b) => a - b);
   const sortedSeams = seams.slice().sort((a, b) => a.id - b.id);
   const metricsById = new Map(sherds.map((s) => [s.id, sherdMetrics(s)]));
@@ -168,6 +170,7 @@ function computeLayout(sherds, seams, toleranceMm) {
   const groups = [];
   const unconnected = [];
   const residuals = [];
+  const violations = [];
 
   for (const root of [...componentMembers.keys()].sort((a, b) => a - b)) {
     const memberSet = componentMembers.get(root);
@@ -196,14 +199,29 @@ function computeLayout(sherds, seams, toleranceMm) {
       const predicted = geo.poseAcrossSeam(poseFrom, s);
       const m = metricsById.get(s.to_id);
       const dev = geo.poseDeviationMm(predicted, poseToExisting, geo.featurePoints(m.wMm, m.hMm));
+      const within = dev.distanceMm <= toleranceMm;
       residuals.push({
         seam_id: s.id,
         from_id: s.from_id,
         to_id: s.to_id,
         distance_mm: round3(dev.distanceMm),
         rotation_deg: round3(dev.rotationDeg),
-        within_tolerance: dev.distanceMm <= toleranceMm,
+        within_tolerance: within,
       });
+      if (!within) {
+        // 超差：给出该环在生成树上的冲突链（不含超差接缝自身）
+        const path = treePath(tree, s.from_id, s.to_id);
+        violations.push({
+          seam_id: s.id,
+          from_id: s.from_id,
+          to_id: s.to_id,
+          distance_mm: round3(dev.distanceMm),
+          rotation_deg: round3(dev.rotationDeg),
+          tolerance_mm: toleranceMm,
+          sherd_path: path.sherdPath,
+          seam_path: path.seamPath,
+        });
+      }
     }
 
     groups.push({
@@ -217,9 +235,35 @@ function computeLayout(sherds, seams, toleranceMm) {
   }
 
   residuals.sort((a, b) => a.seam_id - b.seam_id);
+  violations.sort((a, b) => a.seam_id - b.seam_id);
   groups.sort((a, b) => a.root_sherd_id - b.root_sherd_id);
   unconnected.sort((a, b) => a - b);
+  return { groups, unconnected, residuals, violations };
+}
+
+function computeLayout(sherds, seams, toleranceMm) {
+  const { groups, unconnected, residuals } = analyzeLayout(sherds, seams, toleranceMm);
   return { groups, unconnected, residuals };
+}
+
+// 接缝修订评估：保持接缝身份（id）、采纳排序（id 升序）与两端陶片不变，
+// 仅替换该接缝的 θ/平移/说明，随后“按原接缝身份及排序”从头重算布局与
+// 全部闭合环残差。纯计算、不写库，供预览与确认共用，保证两者口径一致。
+function evaluateRevision(sherds, seams, seamId, revised, toleranceMm) {
+  const idx = seams.findIndex((s) => s.id === seamId);
+  if (idx < 0) return null;
+  const original = seams[idx];
+  const updated = {
+    ...original,
+    theta_deg: revised.theta_deg,
+    tx: revised.tx,
+    ty: revised.ty,
+    join_note: revised.join_note,
+  };
+  const nextSeams = seams.slice();
+  nextSeams[idx] = updated;
+  const result = analyzeLayout(sherds, nextSeams, toleranceMm);
+  return { revised_seam: updated, ...result };
 }
 
 // 生成树中 a -> b 的接缝链
@@ -306,4 +350,4 @@ function evaluateNewSeam(sherds, seams, candidate, toleranceMm) {
   };
 }
 
-module.exports = { computeLayout, evaluateNewSeam, sherdMetrics };
+module.exports = { computeLayout, analyzeLayout, evaluateRevision, evaluateNewSeam, sherdMetrics };

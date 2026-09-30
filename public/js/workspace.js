@@ -24,6 +24,7 @@ export async function mountWorkspace(projectId) {
 
       <div class="canvas-wrap" id="canvas-wrap">
         <canvas id="work-canvas"></canvas>
+        <div class="preview-bar" id="preview-bar" hidden></div>
         <div class="canvas-toolbar">
           <button class="secondary" id="zoom-in">＋</button>
           <button class="secondary" id="zoom-out">－</button>
@@ -38,6 +39,9 @@ export async function mountWorkspace(projectId) {
 
   let state = await api.getProject(projectId);
   let cards = computeCards(state.layout, state.sherds);
+  // 修订预览（未落库的临时状态）。非 null 时画布/右栏展示“修订后”的布局；
+  // 写入状态（版本/容差/侧栏）仍以已提交的 state 为准。
+  let preview = null; // { state, cards, seamId, params, stale }
   const imageCache = new Map();
   const selected = { sherdId: null, seamId: null };
   let highlightSeamIds = new Set();
@@ -63,10 +67,15 @@ export async function mountWorkspace(projectId) {
     return entry;
   }
 
-  function sherdById(id) { return state.sherds.find((s) => s.id === id); }
-  function seamById(id) { return state.seams.find((s) => s.id === id); }
+  // 修订预览中读取的是“修订后”的临时状态；未预览时即已提交状态。
+  function cur() { return preview ? preview.state : state; }
+  function curCards() { return preview ? preview.cards : cards; }
+
+  function sherdById(id) { return cur().sherds.find((s) => s.id === id); }
+  function seamById(id) { return cur().seams.find((s) => s.id === id); }
   function cardOfSherd(id) {
-    return cards.find((c) => (c.kind === 'group' ? c.group.member_ids.includes(id) : c.sherdId === id));
+    const cs = curCards();
+    return cs.find((c) => (c.kind === 'group' ? c.group.member_ids.includes(id) : c.sherdId === id));
   }
 
   function resizeCanvas() {
@@ -84,8 +93,9 @@ export async function mountWorkspace(projectId) {
 
   function fitView() {
     const r = wrapEl.getBoundingClientRect();
-    const contentW = cards.contentW || 400;
-    const contentH = cards.contentH || 300;
+    const cc = curCards();
+    const contentW = cc.contentW || 400;
+    const contentH = cc.contentH || 300;
     viewT.zoom = Math.min(r.width / contentW, r.height / contentH) * 0.95;
     if (!Number.isFinite(viewT.zoom) || viewT.zoom <= 0) viewT.zoom = 1;
     viewT.ox = (r.width - contentW * viewT.zoom) / 2;
@@ -103,12 +113,20 @@ export async function mountWorkspace(projectId) {
     const r = wrapEl.getBoundingClientRect();
     ctx.clearRect(0, 0, r.width, r.height);
     seamLabelBoxes = [];
+    const layout = cur().layout;
+    const drawCards = curCards();
+
+    // 预览模式给整个画布一层提示底色
+    if (preview) {
+      ctx.fillStyle = 'rgba(196,124,30,.10)';
+      ctx.fillRect(0, 0, r.width, r.height);
+    }
 
     // 卡片底板
-    for (const c of cards) {
+    for (const c of drawCards) {
       const p = w2s(c.x, c.y);
-      ctx.fillStyle = '#fffdf8';
-      ctx.strokeStyle = '#cfc5b0';
+      ctx.fillStyle = preview ? '#fffaf0' : '#fffdf8';
+      ctx.strokeStyle = preview ? '#d9b06b' : '#cfc5b0';
       ctx.lineWidth = 1;
       roundRect(ctx, p.x, p.y, c.w * viewT.zoom, c.h * viewT.zoom, 10);
       ctx.fill();
@@ -121,15 +139,15 @@ export async function mountWorkspace(projectId) {
     }
 
     // 接缝（先画线，陶片盖在上面）
-    for (const c of cards) {
+    for (const c of drawCards) {
       if (c.kind !== 'group') continue;
       const g = c.group;
       const treeSet = new Set(g.tree_seam_ids);
-      for (const seam of state.seams) {
+      for (const seam of cur().seams) {
         if (!g.member_ids.includes(seam.from_id)) continue;
         const isTree = treeSet.has(seam.id);
-        const pFrom = sherdWorldPose(state.layout, c, seam.from_id);
-        const pTo = sherdWorldPose(state.layout, c, seam.to_id);
+        const pFrom = sherdWorldPose(layout, c, seam.from_id);
+        const pTo = sherdWorldPose(layout, c, seam.to_id);
         if (!pFrom || !pTo) continue;
         const mA = sherdMm(sherdById(seam.from_id));
         const mB = sherdMm(sherdById(seam.to_id));
@@ -138,9 +156,10 @@ export async function mountWorkspace(projectId) {
         const cA = w2s(aW.x, aW.y);
         const cB = w2s(bW.x, bW.y);
         const active = selected.seamId === seam.id || highlightSeamIds.has(seam.id);
+        const isRevised = preview && preview.seamId === seam.id;
         ctx.save();
-        ctx.strokeStyle = active ? '#2b6cb0' : isTree ? '#8a5a2b' : '#b0551f';
-        ctx.lineWidth = active ? 3.5 : 2;
+        ctx.strokeStyle = active ? '#2b6cb0' : isRevised ? '#c07c1e' : isTree ? '#8a5a2b' : '#b0551f';
+        ctx.lineWidth = active ? 3.5 : isRevised ? 3 : 2;
         if (!isTree) ctx.setLineDash([7, 5]);
         ctx.beginPath();
         ctx.moveTo(cA.x, cA.y);
@@ -154,7 +173,7 @@ export async function mountWorkspace(projectId) {
         ctx.font = '600 11px ui-monospace, Menlo, monospace';
         const tw = ctx.measureText(label).width;
         const bx = midX - tw / 2 - 5, by = midY - 9, bw = tw + 10, bh = 17;
-        ctx.fillStyle = active ? '#2b6cb0' : (isTree ? '#8a5a2b' : '#b0551f');
+        ctx.fillStyle = active ? '#2b6cb0' : isRevised ? '#c07c1e' : (isTree ? '#8a5a2b' : '#b0551f');
         roundRect(ctx, bx, by, bw, bh, 4);
         ctx.fill();
         ctx.fillStyle = '#fff';
@@ -164,11 +183,11 @@ export async function mountWorkspace(projectId) {
     }
 
     // 陶片
-    for (const c of cards) {
+    for (const c of drawCards) {
       const ids = c.kind === 'group' ? c.group.member_ids : [c.sherdId];
       for (const id of ids) {
         const sh = sherdById(id);
-        const pose = sherdWorldPose(state.layout, c, id);
+        const pose = sherdWorldPose(layout, c, id);
         if (!pose) continue;
         const m = sherdMm(sh);
         const entry = getImage(sh);
@@ -260,7 +279,7 @@ export async function mountWorkspace(projectId) {
     const lab = seamLabelBoxes.find((b) => sx >= b.x && sx <= b.x + b.w && sy >= b.y && sy <= b.y + b.h);
     if (lab) { selected.seamId = lab.seamId; selected.sherdId = null; highlightSeamIds = new Set([lab.seamId]); renderAll(); return; }
     const w = s2w(sx, sy);
-    const hit = hitSherd(w.x, w.y, state.sherds, state.layout, cards);
+    const hit = hitSherd(w.x, w.y, cur().sherds, cur().layout, curCards());
     if (hit && hit.sherd) {
       selected.sherdId = hit.sherd.id;
       selected.seamId = null;
@@ -321,18 +340,18 @@ export async function mountWorkspace(projectId) {
   function renderRightPanel() {
     const panel = document.getElementById('right-panel');
     const p = state.project;
-    const residualsById = new Map(state.layout.residuals.map((r) => [r.seam_id, r]));
+    const residualsById = new Map(cur().layout.residuals.map((r) => [r.seam_id, r]));
 
     panel.innerHTML = `
       <div class="pane">
         <h3>方案设置</h3>
         <div class="kv">
-          <input type="text" id="p-name" value="${esc(p.name)}" style="width:100%;margin-bottom:8px" />
+          <input type="text" id="p-name" value="${esc(p.name)}" style="width:100%;margin-bottom:8px" ${preview ? 'disabled' : ''} />
           <label class="field">毫米容差（成环闭合误差超过即拒绝）
             <div style="display:flex;gap:8px;align-items:center">
-              <input type="number" id="p-tol" min="0.01" step="0.1" value="${p.tolerance_mm}" />
+              <input type="number" id="p-tol" min="0.01" step="0.1" value="${p.tolerance_mm}" ${preview ? 'disabled' : ''} />
               <span>mm</span>
-              <button id="p-save" style="margin-left:auto">保存</button>
+              <button id="p-save" style="margin-left:auto" ${preview ? 'disabled' : ''}>保存</button>
             </div>
           </label>
           <div style="margin-top:6px">版本号 v${p.version} · 更新于 ${esc(p.updated_at || '')}</div>
@@ -340,6 +359,7 @@ export async function mountWorkspace(projectId) {
         </div>
       </div>
 
+      <div class="pane" id="pane-preview"></div>
       <div class="pane" id="pane-sherd"></div>
       <div class="pane flex" id="pane-seams"></div>`;
 
@@ -351,8 +371,102 @@ export async function mountWorkspace(projectId) {
       document.getElementById('stale-reload').onclick = () => location.reload();
     }
 
+    renderPreviewPane(residualsById);
     renderSherdPane();
     renderSeamsPane(residualsById);
+  }
+
+  // ---------- 修订预览 ----------
+  function renderPreviewBar() {
+    const bar = document.getElementById('preview-bar');
+    if (!preview) { bar.hidden = true; bar.innerHTML = ''; return; }
+    bar.hidden = false;
+    const n = preview.state.violations ? preview.state.violations.length : 0;
+    bar.className = 'preview-bar ' + (n ? 'bad' : 'ok');
+    bar.innerHTML = `
+      <span class="pb-title">🔧 接缝 #${preview.seamId} 修订预览（未落库）</span>
+      <span class="pb-sub">${n
+        ? `✘ ${n} 条接缝闭合残差超容差 ${preview.state.tolerance_mm} mm，确认将被拒绝`
+        : `✔ 全部 ${preview.state.layout.residuals.length} 个闭合环残差均在 ${preview.state.tolerance_mm} mm 容差内`}</span>
+      <span class="pb-spacer"></span>
+      <button class="secondary" id="pb-cancel">取消预览</button>
+      <button id="pb-confirm" ${n ? 'disabled' : ''}>确认修订（v${state.project.version}）</button>`;
+    document.getElementById('pb-cancel').onclick = () => exitPreview();
+    document.getElementById('pb-confirm').onclick = () => confirmRevision();
+    if (preview.stale) {
+      bar.insertAdjacentHTML('beforeend',
+        '<span class="pb-stale">⚠ 方案已被他人更新（服务器 v' + staleSeenVersion +
+        '），此预览基于旧版本，请取消后重新修订</span>');
+    }
+  }
+
+  function renderPreviewPane() {
+    const pane = document.getElementById('pane-preview');
+    if (!preview) { pane.innerHTML = ''; pane.style.display = 'none'; return; }
+    pane.style.display = '';
+    const cs = preview.state;
+    const orig = cs.original_seam;
+    const rev = cs.revised_seam;
+
+    // 位姿发生变化的陶片
+    const poseRows = [];
+    const oldPoseById = new Map();
+    for (const g of state.layout.groups) for (const id of g.member_ids) oldPoseById.set(id, g.poses[id]);
+    for (const g of cs.layout.groups) {
+      for (const id of g.member_ids) {
+        const np = g.poses[id];
+        const op = oldPoseById.get(id);
+        if (!op || Math.abs(op.x - np.x) > 1e-6 || Math.abs(op.y - np.y) > 1e-6 || Math.abs(op.theta - np.theta) > 1e-6) {
+          poseRows.push({ id, op, np });
+        }
+      }
+    }
+
+    const violationsHtml = cs.violations.length
+      ? cs.violations.map((v) => {
+          const chain = v.conflict_chain;
+          return `<div class="conflict-box" data-vseam="${v.seam_id}">
+            <div><b>超差接缝 #${v.seam_id}</b>（#${v.from_id} → #${v.to_id}）残差
+              ${v.distance_mm} mm / ${v.rotation_deg}°，超过 ${v.tolerance_mm} mm</div>
+            <div style="margin-top:6px"><b>冲突链：</b>
+              <div class="chain-seams" style="font-family:ui-monospace,Menlo,monospace;margin:4px 0">
+                ${chain.sherds.map((s) => `#${s.id}`).join(' → ')} · 沿接缝 ${chain.seams.map((s) => `#${s.id}`).join(' → ')}
+              </div>
+              <pre>${chain.seams.map((s) => `接缝 #${s.id}  (#${s.from_id}→#${s.to_id})${s.join_note ? `  ${esc(s.join_note)}` : ''}`).join('\n') || '（链上无接缝）'}</pre>
+            </div>
+          </div>`;
+        }).join('')
+      : `<div class="residual ok" style="font-size:13px">全部闭合环残差在容差内，可确认修订。</div>`;
+
+    pane.innerHTML = `
+      <h3>修订预览 · 接缝 #${preview.seamId}</h3>
+      <div class="kv" style="font-size:12.5px">
+        θ：${orig.theta_deg}° → <b>${rev.theta_deg}°</b>；
+        tx：${orig.tx} → <b>${rev.tx}</b> mm；ty：${orig.ty} → <b>${rev.ty}</b> mm
+        ${orig.join_note !== rev.join_note ? '<br/>说明已更新：' + esc(rev.join_note || '（空）') : (rev.join_note ? '<br/>说明：' + esc(rev.join_note) : '')}
+      </div>
+      <div style="margin-top:6px">${violationsHtml}</div>
+      ${poseRows.length ? `<div class="kv" style="margin-top:6px"><b>位姿变化（${poseRows.length} 片）：</b>
+        <div style="max-height:120px;overflow:auto;margin-top:4px;font-family:ui-monospace,Menlo,monospace;font-size:12px">
+          ${poseRows.map((r) => `#${r.id}: (${r.op.x},${r.op.y},${r.op.theta}°) → (${r.np.x},${r.np.y},${r.np.theta}°)`).join('<br/>')}
+        </div></div>` : '<div class="kv" style="margin-top:6px">所有陶片位姿不变。</div>'}
+      <div class="actions">
+        <button class="secondary" id="pp-cancel">取消</button>
+        <button id="pp-confirm" ${cs.violations.length ? 'disabled' : ''}>确认修订</button>
+      </div>`;
+
+    pane.querySelectorAll('[data-vseam]').forEach((box) => {
+      box.style.cursor = 'pointer';
+      box.onclick = () => {
+        selected.seamId = parseInt(box.dataset.vseam, 10);
+        selected.sherdId = null;
+        const vs = cs.violations.find((v) => v.seam_id === selected.seamId);
+        highlightSeamIds = new Set(vs ? vs.conflict_chain.seams.map((s) => s.id) : [selected.seamId]);
+        renderAll();
+      };
+    });
+    document.getElementById('pp-cancel').onclick = () => exitPreview();
+    document.getElementById('pp-confirm').onclick = () => confirmRevision();
   }
 
   function renderSherdPane() {
@@ -384,14 +498,17 @@ export async function mountWorkspace(projectId) {
         ${sh.scale_px
           ? `比例尺：${sh.scale_px} px = ${sh.scale_mm} mm（1 mm ≈ ${m.ppm.toFixed(3)} px）<br/>片尺寸：${m.wMm.toFixed(1)} × ${m.hMm.toFixed(1)} mm`
           : '<span class="badge warn">尚未标记毫米比例尺</span>'}
-        ${pose ? `<br/>世界位姿：x=${pose.x} mm, y=${pose.y} mm, θ=${pose.theta}°` : ''}
+        ${pose ? `<br/>${preview ? '<span class="badge warn">预览位姿</span> ' : ''}世界位姿：x=${pose.x} mm, y=${pose.y} mm, θ=${pose.theta}°` : ''}
       </div>
       ${chainHtml}
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <button id="btn-scale">${sh.scale_px ? '修改比例尺' : '标记比例尺'}</button>
-        <button class="danger" id="btn-del-sherd">删除陶片</button>
-      </div>`;
+      ${preview
+        ? '<div class="kv" style="margin-top:10px">修订预览中，陶片操作已暂停，请先确认或取消预览。</div>'
+        : `<div style="display:flex;gap:8px;margin-top:10px">
+          <button id="btn-scale">${sh.scale_px ? '修改比例尺' : '标记比例尺'}</button>
+          <button class="danger" id="btn-del-sherd">删除陶片</button>
+        </div>`}`;
 
+    if (preview) return;
     document.getElementById('btn-scale').onclick = () =>
       openScaleModal(sh, state.project.version, applyServerState);
     document.getElementById('btn-del-sherd').onclick = async () => {
@@ -405,27 +522,34 @@ export async function mountWorkspace(projectId) {
       }
     };
     const cc = document.getElementById('chain-card');
-    if (cc) cc.onclick = () => { highlightSeamIds = new Set(chain); draw(); renderSeamsPane(new Map(state.layout.residuals.map((r) => [r.seam_id, r]))); };
+    if (cc) cc.onclick = () => { highlightSeamIds = new Set(chain); draw(); renderSeamsPane(new Map(cur().layout.residuals.map((r) => [r.seam_id, r]))); };
   }
 
   function renderSeamsPane(residualsById) {
     const pane = document.getElementById('pane-seams');
+    const c = cur();
     const treeSet = new Set();
-    state.layout.groups.forEach((g) => g.tree_seam_ids.forEach((id) => treeSet.add(id)));
+    c.layout.groups.forEach((g) => g.tree_seam_ids.forEach((id) => treeSet.add(id)));
+    const violatingIds = new Set((c.violations || []).map((v) => v.seam_id));
 
-    const rows = state.seams.map((s) => {
+    const rows = c.seams.map((s) => {
       const res = residualsById.get(s.id);
       const a = sherdById(s.from_id), b = sherdById(s.to_id);
+      const isRevised = preview && preview.seamId === s.id;
       return `<div class="seam-row ${selected.seamId === s.id ? 'active' : ''}" data-id="${s.id}">
         <div class="top">
           <span>
             <b>#${s.id}</b>
             <span class="${treeSet.has(s.id) ? 'tag-tree' : 'tag-cycle'}">
               ${treeSet.has(s.id) ? '生成树接缝' : '成环接缝'}
-            </span><br/>
+            </span>
+            ${isRevised ? '<span class="badge" style="background:#f6e6cc;color:#c07c1e">修订预览中</span>' : ''}<br/>
             <span class="kv">#${s.from_id} ${esc(a ? a.label : '')} → #${s.to_id} ${esc(b ? b.label : '')}</span>
           </span>
-          <button class="danger" data-undo="${s.id}">撤销</button>
+          <span class="seam-actions">
+            ${preview ? '' : `<button class="secondary" data-revise="${s.id}">修订</button>`}
+            <button class="danger" data-undo="${s.id}" ${preview ? 'disabled' : ''}>撤销</button>
+          </span>
         </div>
         <div class="kv">θ=${s.theta_deg}°, tx=${s.tx} mm, ty=${s.ty} mm</div>
         ${s.join_note ? `<div class="note">📝 ${esc(s.join_note)}</div>` : ''}
@@ -433,10 +557,11 @@ export async function mountWorkspace(projectId) {
           闭合残差：${res.distance_mm} mm / ${res.rotation_deg}°
           ${res.within_tolerance ? '✔ 容差内' : `✘ 超容差 ${state.project.tolerance_mm} mm`}
         </div>` : ''}
+        ${violatingIds.has(s.id) ? '<div class="residual bad">↑ 该超差接缝的冲突链见上方“修订预览”面板（点击可在画布高亮）</div>' : ''}
       </div>`;
     }).join('');
 
-    pane.innerHTML = `<h3>接缝（${state.seams.length}）</h3>
+    pane.innerHTML = `<h3>接缝（${c.seams.length}）${preview ? ' · 预览' : ''}</h3>
       <div class="legend">
         <span><i style="border-color:#8a5a2b"></i>生成树（决定布局）</span>
         <span><i style="border-color:#b0551f"></i>成环（仅校验残差）</span>
@@ -445,13 +570,14 @@ export async function mountWorkspace(projectId) {
 
     pane.querySelectorAll('.seam-row').forEach((el) => {
       el.addEventListener('click', (e) => {
-        if (e.target.dataset.undo) return;
+        if (e.target.dataset.undo || e.target.dataset.revise) return;
         selected.seamId = parseInt(el.dataset.id, 10);
         selected.sherdId = null;
         highlightSeamIds = new Set([selected.seamId]);
         renderAll();
       });
     });
+    if (preview) return;
     pane.querySelectorAll('[data-undo]').forEach((btn) => {
       btn.onclick = async (e) => {
         e.stopPropagation();
@@ -466,6 +592,12 @@ export async function mountWorkspace(projectId) {
             toast('接缝已撤销，布局已重新推导', 'success');
           } catch (err) { handleWriteError(err); }
         }
+      };
+    });
+    pane.querySelectorAll('[data-revise]').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        openRevisionModal(parseInt(btn.dataset.revise, 10));
       };
     });
   }
@@ -483,6 +615,7 @@ export async function mountWorkspace(projectId) {
   // ---------- 上传 ----------
   const photoInput = document.getElementById('photo-input');
   document.getElementById('upload-box').addEventListener('click', (e) => {
+    if (preview) { toast('修订预览中，请先确认或取消预览', 'warn'); return; }
     if (e.target.tagName !== 'INPUT') photoInput.click();
   });
   photoInput.addEventListener('change', async () => {
@@ -528,6 +661,7 @@ export async function mountWorkspace(projectId) {
   document.getElementById('btn-new-seam').onclick = chooseSeamEnds;
 
   function chooseSeamEnds() {
+    if (preview) return toast('修订预览中，请先确认或取消预览', 'warn');
     const scaled = state.sherds.filter((s) => s.scale_px);
     if (scaled.length < 2) return toast('至少要有两片已标记比例尺的陶片', 'warn');
     const { body, close } = openModal({ title: '选择接缝两端' });
@@ -599,6 +733,132 @@ export async function mountWorkspace(projectId) {
     body.querySelector('#cycle-ok').onclick = close;
   }
 
+  // ---------- 接缝修订：先预览（不落库），确认时按当前版本原子提交 ----------
+  function openRevisionModal(seamId) {
+    const seam = state.seams.find((s) => s.id === seamId);
+    if (!seam) return;
+    const a = state.sherds.find((s) => s.id === seam.from_id);
+    const b = state.sherds.find((s) => s.id === seam.to_id);
+    const { body, close } = openModal({
+      title: `修订接缝 #${seamId}：#${seam.from_id} ${esc(a ? a.label : '')} → #${seam.to_id} ${esc(b ? b.label : '')}`,
+    });
+    body.innerHTML = `
+      <p class="align-hint">修订仅改变该接缝的旋转角、毫米平移与说明；接缝身份（#${seamId}）、采纳排序与连接的两片陶片都不变。先“预览重算”，确认无误再提交。</p>
+      <div class="row">
+        <label class="field">旋转角 θ (°)
+          <input type="number" id="rv-theta" step="0.1" min="-360" max="360" value="${seam.theta_deg}" />
+        </label>
+        <label class="field">平移 tx (mm)
+          <input type="number" id="rv-tx" step="0.1" value="${seam.tx}" />
+        </label>
+        <label class="field">平移 ty (mm)
+          <input type="number" id="rv-ty" step="0.1" value="${seam.ty}" />
+        </label>
+      </div>
+      <div class="row">
+        <label class="field" style="flex:1">接缝说明（断口位置、走向、吻合特征……）
+          <input type="text" id="rv-note" maxlength="2000" value="${esc(seam.join_note || '')}" placeholder="例如：修订口沿对齐角度" />
+        </label>
+      </div>
+      <div class="actions">
+        <button class="secondary" id="rv-cancel">取消</button>
+        <button id="rv-preview">预览重算（不改动方案）</button>
+      </div>`;
+
+    const readParams = () => ({
+      theta_deg: parseFloat(body.querySelector('#rv-theta').value),
+      tx: parseFloat(body.querySelector('#rv-tx').value),
+      ty: parseFloat(body.querySelector('#rv-ty').value),
+      join_note: body.querySelector('#rv-note').value,
+    });
+
+    body.querySelector('#rv-cancel').onclick = close;
+    body.querySelector('#rv-preview').onclick = async () => {
+      const params = readParams();
+      if (![params.theta_deg, params.tx, params.ty].every(Number.isFinite)) {
+        return toast('θ、tx、ty 必须是数字', 'error');
+      }
+      try {
+        const pv = await api.previewSeamRevision(seamId, params);
+        close();
+        enterPreview(pv, params);
+        if (pv.acceptable) toast('预览：全部闭合环残差在容差内', 'success');
+        else toast(`预览：${pv.violations.length} 条接缝闭合残差超容差`, 'warn');
+      } catch (err) {
+        toast(err.message, 'error'); // 400 参数无效 / 404 接缝不存在
+      }
+    };
+  }
+
+  function enterPreview(pv, params) {
+    // 预览响应即“若采纳”的完整方案视图（接缝/布局与确认口径一致）
+    preview = {
+      state: pv,
+      cards: computeCards(pv.layout, pv.sherds),
+      seamId: pv.revised_seam_id,
+      params,
+      stale: false,
+    };
+    selected.seamId = pv.revised_seam_id;
+    selected.sherdId = null;
+    highlightSeamIds = new Set([pv.revised_seam_id]);
+    renderAll();
+    fitView();
+  }
+
+  function exitPreview() {
+    preview = null;
+    renderAll();
+    fitView();
+  }
+
+  async function confirmRevision() {
+    if (!preview) return;
+    const { seamId, params } = preview;
+    try {
+      const next = await api.reviseSeam(seamId, state.project.version, params);
+      preview = null;
+      applyServerState(next);
+      fitView();
+      toast(`接缝 #${seamId} 已修订，方案版本递增为 v${next.project.version}`, 'success');
+    } catch (err) {
+      if (err.status === 409) {
+        // 版本已变化：旧预览作废，不得套用
+        if (preview) preview.stale = true;
+        renderPreviewBar();
+        handleWriteError(err);
+      } else if (err.status === 422) {
+        // 服务器在当前版本上原子重算后拒绝：状态未变，退出预览并展示冲突链
+        exitPreview();
+        showRevisionConflict(err.data.error);
+      } else {
+        handleWriteError(err);
+      }
+    }
+  }
+
+  function showRevisionConflict(error) {
+    const vs = error.violations || [];
+    const { body, close } = openModal({ title: '🚫 修订被拒绝：闭合环残差超容差', wide: true });
+    body.innerHTML = `
+      <div class="conflict-box">
+        <div>${esc(error.message)}</div>
+        ${vs.map((v) => {
+          const chain = v.conflict_chain;
+          return `<div style="margin-top:10px">
+            <b>超差接缝 #${v.seam_id}</b>（#${v.from_id} → #${v.to_id}）：偏差 ${v.distance_mm} mm / ${v.rotation_deg}°，容差 ${v.tolerance_mm} mm
+            <div class="chain-seams" style="font-family:ui-monospace,Menlo,monospace;margin:4px 0">
+              冲突链：${chain.sherds.map((s) => `#${s.id}`).join(' → ')} · 沿接缝 ${chain.seams.map((s) => `#${s.id}`).join(' → ')}
+            </div>
+            <pre>${chain.seams.map((s) => `接缝 #${s.id}  (#${s.from_id}→#${s.to_id})${s.join_note ? `  ${esc(s.join_note)}` : ''}`).join('\n') || '（链上无接缝）'}</pre>
+          </div>`;
+        }).join('')}
+        <div class="kv" style="margin-top:6px">接缝参数、方案版本与布局均保持不变（事务已回滚）。</div>
+      </div>
+      <div class="actions"><button id="rc-ok">知道了</button></div>`;
+    body.querySelector('#rc-ok').onclick = close;
+  }
+
   function handleWriteError(err) {
     if (err.status === 409) {
       const info = err.data && err.data.error;
@@ -626,6 +886,7 @@ export async function mountWorkspace(projectId) {
   // ---------- 状态应用 / 轮询 ----------
   function applyServerState(next) {
     state = next;
+    preview = null; // 任何已提交的写入都终结预览态
     cards = computeCards(state.layout, state.sherds);
     stale = false;
     staleSeenVersion = null;
@@ -647,7 +908,8 @@ export async function mountWorkspace(projectId) {
       if (fresh.project.version !== state.project.version) {
         stale = true;
         staleSeenVersion = fresh.project.version;
-        // 不静默替换画布内容，只在右栏提示，由用户决定何时刷新
+        // 不静默替换画布内容，只提示；预览中的旧预览同时标记作废，确认会 409
+        if (preview) { preview.stale = true; renderPreviewBar(); }
         renderRightPanel();
         toast('检测到他人更新了方案，请确认后刷新', 'warn');
       }
@@ -668,6 +930,7 @@ export async function mountWorkspace(projectId) {
     renderTopbar();
     renderSidebar();
     renderRightPanel();
+    renderPreviewBar();
     draw();
   }
 

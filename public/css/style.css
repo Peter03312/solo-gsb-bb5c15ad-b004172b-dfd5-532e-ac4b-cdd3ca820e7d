@@ -116,6 +116,24 @@ table.list a { color: var(--accent); font-weight: 600; text-decoration: none; }
 .canvas-toolbar button { padding: 3px 10px; font-size: 13px; }
 .canvas-hint { position: absolute; bottom: 10px; left: 10px; font-size: 12px; color: var(--muted); background: rgba(255,253,248,.85); padding: 4px 8px; border-radius: 6px; }
 
+/* 修订预览浮条 */
+.preview-bar {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 10px; z-index: 20;
+  border-radius: 8px; padding: 8px 12px; font-size: 13px;
+  background: #fdf3e0; border: 1px solid var(--warn); color: #6b4610;
+  box-shadow: 0 4px 14px rgba(0,0,0,.15); max-width: calc(100% - 120px);
+}
+.preview-bar.bad { background: #fbeae8; border-color: var(--danger); color: #7a201b; }
+.preview-bar .pb-title { font-weight: 600; white-space: nowrap; }
+.preview-bar .pb-sub { color: var(--muted); white-space: nowrap; }
+.preview-bar .pb-spacer { width: 4px; }
+.preview-bar .pb-stale { font-weight: 600; color: var(--danger); }
+.preview-bar button { padding: 4px 12px; font-size: 13px; }
+
+.seam-row .seam-actions { display: inline-flex; gap: 6px; align-items: center; }
+.seam-row .seam-actions button { padding: 3px 10px; font-size: 12px; }
+
 .right-panel {
   width: 330px; flex: 0 0 330px; background: var(--panel); border-left: 1px solid var(--line);
   display: flex; flex-direction: column; min-height: 0;

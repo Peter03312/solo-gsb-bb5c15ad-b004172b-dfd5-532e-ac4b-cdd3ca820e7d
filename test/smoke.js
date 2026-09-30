@@ -191,6 +191,103 @@ async function main() {
   const acRes = r.json.layout.residuals.find((x) => x.from_id === a && x.to_id === c);
   assert(acRes && acRes.distance_mm === 0 && acRes.within_tolerance, '残差为 0 仍在 0.5mm 容差内');
 
+  // ========== 接缝修订：预览 + 原子确认 ==========
+  // 把容差调回 2mm 便于演示
+  r = await req('PATCH', `/api/projects/${pid}`, { version: ver, body: { tolerance_mm: 2 } });
+  assert(r.status === 200, '容差恢复 2mm');
+  ver = r.json.project.version;
+
+  // 当前 4 条接缝：#1 A->B tx=-10，#2 B->C tx=-10，#3 A->C tx=-20（成环，残差0），#4 C->D tx=-10
+  const seamsNow = r.json.seams;
+  const sAB = seamsNow.find((x) => x.from_id === a && x.to_id === b).id;
+  const sAC = seamsNow.find((x) => x.from_id === a && x.to_id === c).id;
+
+  // 预览（只读，不带 Base-Version）：把树接缝 A->B 的 tx 改为 -14。
+  // B/C/D 整体右移 4mm；成环接缝 A->C 期望 C 在 20，现布局 24 => 残差 4mm 超差
+  r = await req('POST', `/api/seams/${sAB}/revision-preview`, {
+    body: { theta_deg: 0, tx: -14, ty: 0, join_note: '口沿 A-B（修订试拼）' },
+  });
+  assert(r.status === 200, '修订预览 200（只读，无需 Base-Version）');
+  assert(r.json.acceptable === false, '预览判定不可采纳（有超差环）');
+  assert(r.json.violations.length === 1 && r.json.violations[0].seam_id === sAC,
+    '预览指出超差接缝为成环接缝 A->C');
+  const pvViol = r.json.violations[0];
+  assert(pvViol.distance_mm === 4, `预览残差 4mm（实际 ${pvViol.distance_mm}）`);
+  const sBC = seamsNow.find((x) => x.from_id === b && x.to_id === c).id;
+  const pvChain = pvViol.conflict_chain.seams.map((s) => s.id).join(',');
+  assert(pvChain === `${sAB},${sBC}`, `A->C 冲突链沿生成树 A->B->C（接缝 ${sAB},${sBC}），实际 ${pvChain}`);
+  assert(pvViol.conflict_chain.sherds.map((s) => s.id).join(',') === `${a},${b},${c}`,
+    '冲突链陶片路径 A → B → C');
+  assert(r.json.revised_seam_id === sAB && r.json.revised_seam.tx === -14, '预览回显修订后的接缝参数');
+  assert(r.json.project.version === ver, '预览不推进版本');
+
+  // 预览后已提交布局不变
+  r = await req('GET', `/api/projects/${pid}`);
+  assert(r.json.seams.find((x) => x.id === sAB).tx === -10, '预览不改库：A->B 仍为 tx=-10');
+  assert(r.json.project.version === ver, '预览后方案版本不变');
+  assert(r.json.layout.groups[0].poses[b].x === 10, '预览后读取布局仍为原布局（B 在 10）');
+
+  // 确认该超差修订 => 422 回滚：接缝、版本、布局全不变
+  r = await req('PATCH', `/api/seams/${sAB}`, {
+    version: ver, body: { theta_deg: 0, tx: -14, ty: 0, join_note: '口沿 A-B（修订试拼）' },
+  });
+  assert(r.status === 422, '超差修订被拒绝（422），事务回滚');
+  assert(r.json.error.violations && r.json.error.violations[0].seam_id === sAC, '422 返回超差接缝与冲突链');
+  assert(r.json.error.preview_layout, '422 附带“若采纳”的预览布局供展示');
+  r = await req('GET', `/api/projects/${pid}`);
+  assert(r.json.seams.find((x) => x.id === sAB).tx === -10, '回滚后 A->B 仍为 tx=-10');
+  assert(r.json.project.version === ver, '回滚后版本不变');
+  assert(r.json.layout.groups[0].poses[d].x === 30, '回滚后原布局保持（D 在 30）');
+
+  // 用过期版本确认 => 409，且不套用旧预览、状态不变
+  r = await req('PATCH', `/api/seams/${sAB}`, {
+    version: ver - 1, body: { theta_deg: 0, tx: -14, ty: 0, join_note: 'x' },
+  });
+  assert(r.status === 409, '过期 Base-Version 修订被拒绝（409）');
+  assert(r.json.error.current_version === ver, '409 给出服务器当前版本');
+
+  // 缺少 Base-Version => 428
+  r = await req('PATCH', `/api/seams/${sAB}`, { body: { theta_deg: 0, tx: -14, ty: 0 } });
+  assert(r.status === 428, '修订缺少 Base-Version => 428');
+
+  // 参数无效 / 接缝不存在
+  r = await req('POST', `/api/seams/${sAB}/revision-preview`, { body: { theta_deg: 0, tx: 'NaN', ty: 0 } });
+  assert(r.status === 400, '预览参数无效 => 400 且不改变状态');
+  r = await req('POST', '/api/seams/999999/revision-preview', { body: { theta_deg: 0, tx: 1, ty: 1 } });
+  assert(r.status === 404, '预览不存在的接缝 => 404');
+  r = await req('PATCH', '/api/seams/999999', { version: ver, body: { theta_deg: 0, tx: 1, ty: 1 } });
+  assert(r.status === 404, '修订不存在的接缝 => 404');
+
+  // 合法修订（残差仍 0）：A->B tx 从 -10 改为 -10（等价）必然通过；这里改用角度 360 的等价旋转保持几何不变
+  r = await req('POST', `/api/seams/${sAB}/revision-preview`, {
+    body: { theta_deg: 360, tx: -10, ty: 0, join_note: '口沿 A-B（已修订说明）' },
+  });
+  assert(r.status === 200 && r.json.acceptable === true, '几何不变的修订预览可采纳');
+  assert(r.json.layout.residuals.find((x) => x.seam_id === sAC).distance_mm === 0, '修订后 A->C 残差仍为 0');
+  r = await req('PATCH', `/api/seams/${sAB}`, {
+    version: ver, body: { theta_deg: 360, tx: -10, ty: 0, join_note: '口沿 A-B（已修订说明）' },
+  });
+  assert(r.status === 200, '确认合法修订成功');
+  const verBefore = ver;
+  ver = r.json.project.version;
+  assert(ver === verBefore + 1, `成功后版本只递增一次（v${verBefore} → v${ver}）`);
+  assert(r.json.seams.find((x) => x.id === sAB).join_note === '口沿 A-B（已修订说明）', '接缝说明已更新');
+  assert(r.json.seams.find((x) => x.id === sAB).theta_deg === 360, '旋转角已更新为 360°');
+  assert(r.json.layout.groups[0].poses[b].x === 10 && r.json.layout.groups[0].poses[d].x === 30,
+    '几何不变：B 仍在 10、D 仍在 30');
+  // 接缝 ID 与排序不变
+  const afterIds = r.json.seams.map((x) => x.id);
+  assert(afterIds.length === 4 && afterIds.includes(sAB) && afterIds.join(',') === afterIds.slice().sort((x, y) => x - y).join(','),
+    '修订不新增/删除接缝，ID 与升序排序不变');
+
+  // 读取布局与修订预览一致：再预览同样参数，layout 应与刚确认后的 GET 布局逐字段一致
+  r = await req('GET', `/api/projects/${pid}`);
+  const committedLayout = r.json.layout;
+  r = await req('POST', `/api/seams/${sAB}/revision-preview`, {
+    body: { theta_deg: 360, tx: -10, ty: 0, join_note: '口沿 A-B（已修订说明）' },
+  });
+  assert(JSON.stringify(r.json.layout) === JSON.stringify(committedLayout), '读取布局与预览口径一致');
+
   console.log('\n全部冒烟检查通过 ✅');
   process.exit(0);
 }
